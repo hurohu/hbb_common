@@ -209,7 +209,9 @@ pub struct Config {
         skip_serializing_if = "String::is_empty",
         deserialize_with = "deserialize_string"
     )]
-    pub id: String, // use
+    pub id: String, // use, kept in plain text while id_fixed
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    id_fixed: bool, // user set this id explicitly; never regenerate it
     #[serde(default, deserialize_with = "deserialize_string")]
     enc_id: String, // store
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -751,26 +753,8 @@ impl Config {
         if let Err(err) = Self::validate_or_decrypt_permanent_password_storage(&mut config) {
             log::error!("Failed to validate or decrypt permanent password storage: {err}");
         }
-        let mut id_valid = false;
-        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
-        if encrypted {
-            config.id = id;
-            id_valid = true;
-            store |= store2;
-        } else if
-        // Comment out for forward compatible
-        // crate::get_modified_time(&Self::file_(""))
-        // .checked_sub(std::time::Duration::from_secs(30)) // allow modification during installation
-        // .unwrap_or_else(crate::get_exe_time)
-        // < crate::get_exe_time()
-        // &&
-        !config.id.is_empty()
-            && config.enc_id.is_empty()
-            && !decrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION).1
-        {
-            id_valid = true;
-            store = true;
-        }
+        let (id_valid, store2) = config.resolve_stored_id();
+        store |= store2;
         if !id_valid {
             log::warn!("ID is invalid, generating new one");
             for _ in 0..3 {
@@ -787,6 +771,26 @@ impl Config {
             config.store();
         }
         config
+    }
+
+    // Returns (id_valid, should_store).
+    fn resolve_stored_id(&mut self) -> (bool, bool) {
+        let (decrypted_id, encrypted, store2) =
+            decrypt_str_or_original(&self.enc_id, PASSWORD_ENC_VERSION);
+        // A plain-text id only exists when someone put it there on purpose, so it wins over
+        // enc_id and marks the id as fixed. This also covers a broken or stale enc_id.
+        if !self.id.is_empty() && !decrypt_str_or_original(&self.id, PASSWORD_ENC_VERSION).1 {
+            if !self.id_fixed {
+                self.id_fixed = true;
+                return (true, true);
+            }
+            return (true, !encrypted || decrypted_id != self.id);
+        }
+        if encrypted {
+            self.id = decrypted_id;
+            return (true, store2 || self.id_fixed);
+        }
+        (false, false)
     }
 
     fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<()> {
@@ -867,7 +871,9 @@ impl Config {
             config.enc_id =
                 encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
         }
-        config.id = "".to_owned();
+        if !config.id_fixed {
+            config.id = "".to_owned();
+        }
         Config::store_(&config, "");
     }
 
@@ -1127,6 +1133,22 @@ impl Config {
             return;
         }
         config.id = id.into();
+        config.store();
+    }
+
+    pub fn get_id_fixed() -> bool {
+        CONFIG.read().unwrap().id_fixed
+    }
+
+    /// Sets an id chosen by the user. It is persisted in plain text and is never
+    /// replaced by an auto-generated one.
+    pub fn set_fixed_id(id: &str) {
+        let mut config = CONFIG.write().unwrap();
+        if id == config.id && config.id_fixed {
+            return;
+        }
+        config.id = id.into();
+        config.id_fixed = true;
         config.store();
     }
 
@@ -1412,13 +1434,18 @@ impl Config {
         }
     }
 
-    pub fn update_id() {
+    /// Returns whether the id was replaced.
+    pub fn update_id() -> bool {
+        if Self::get_id_fixed() {
+            return false;
+        }
         // to-do: how about if one ip register a lot of ids?
         let id = Self::get_id();
         let mut rng = rand::thread_rng();
         let new_id = rng.gen_range(1_000_000_000..2_000_000_000).to_string();
         Config::set_id(&new_id);
         log::info!("id updated from {} to {}", id, new_id);
+        true
     }
 
     /// Sets the local permanent password.
@@ -3318,6 +3345,44 @@ mod tests {
             assert_eq!(stored_id, updated_id);
             assert_eq!(Config::get().id, updated_id);
         });
+    }
+
+    #[test]
+    fn test_fixed_id_survives_broken_enc_id() {
+        let mut cfg = Config::default();
+        cfg.id = "hu850719".to_owned();
+        cfg.id_fixed = true;
+        cfg.enc_id = "00AAAA".to_owned();
+
+        let (id_valid, store) = cfg.resolve_stored_id();
+        assert!(id_valid);
+        assert_eq!(cfg.id, "hu850719");
+        assert!(store);
+    }
+
+    #[test]
+    fn test_plaintext_id_is_treated_as_fixed() {
+        let mut cfg = Config::default();
+        cfg.id = "hu850719".to_owned();
+
+        let (id_valid, store) = cfg.resolve_stored_id();
+        assert!(id_valid);
+        assert_eq!(cfg.id, "hu850719");
+        assert!(cfg.id_fixed);
+        assert!(store);
+    }
+
+    #[test]
+    fn test_plaintext_id_wins_over_existing_enc_id() {
+        let mut cfg = Config::default();
+        cfg.id = "hu850719".to_owned();
+        cfg.enc_id = encrypt_str_or_original("68215386", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+
+        let (id_valid, store) = cfg.resolve_stored_id();
+        assert!(id_valid);
+        assert_eq!(cfg.id, "hu850719");
+        assert!(cfg.id_fixed);
+        assert!(store);
     }
 
     #[test]
